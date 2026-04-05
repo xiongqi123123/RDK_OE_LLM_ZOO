@@ -15,6 +15,7 @@ from leap_llm.apis.calibration import CalibrationDataPreparer
 from leap_llm.apis.verifier.types import TensorDict, TensorInfo, VerifierArgs
 from leap_llm.apis.verifier.utils import cast_to_tensor_info, time_block
 from leap_llm.models.deepseek.model import DeepSeek
+from leap_llm.models.gemma4.model import Gemma4Vision
 from leap_llm.models.internvl_1b.model import Internlm1b, Internvl1bVision
 from leap_llm.models.internvl_2b.model import Internlm2b, Internvl2bVision
 from leap_llm.models.siglip.model import SiglipVision
@@ -22,6 +23,8 @@ from leap_llm.models.siglip.model import SiglipVision
 DEEPSEEK_MODELS = ["deepseek-qwen-1_5b", "deepseek-qwen-7b"]
 INTERNVL_MODELS = ["internvl2-1b", "internvl2-2b", "internvl2_5-1b", "internvl2_5-2b"]
 SIGLIP_MODELS = ["siglip-so400m"]
+GEMMA4_MODELS = ["gemma4-e2b-vision"]
+VISION_ONLY_MODELS = SIGLIP_MODELS + GEMMA4_MODELS
 padding_side_dict = {
     "internvl2-1b": "right",
     "internvl2-2b": "right",
@@ -93,8 +96,8 @@ class Backend:
         self._hbm_llm_module = self._load_hbm_module(self.args.hbm_llm_model_path)
         self._hbm_vlm_module = self._load_hbm_module(self.args.hbm_vlm_model_path)
 
-        # set calib data preparer (not needed for vision-only models)
-        if self.args.model_name not in SIGLIP_MODELS:
+        # Registered visual subgraphs do not need text-side calibration preparation.
+        if self.args.model_name not in VISION_ONLY_MODELS:
             self.calib_data_preparer = CalibrationDataPreparer(
                 self.args.model_dir,
                 seq_len=self.args.chunk_size,
@@ -117,8 +120,8 @@ class Backend:
 
         ckpt_path = os.path.join(self.args.model_dir, "model_checkpoint.pth")
 
-        # Vision-only models (SigLIP) don't use AutoModelForCausalLM
-        if self.args.model_name not in SIGLIP_MODELS:
+        # Registered visual subgraphs (SigLip / Gemma4 vision) do not use AutoModelForCausalLM.
+        if self.args.model_name not in VISION_ONLY_MODELS:
             model = AutoModelForCausalLM.from_pretrained(
                 self.args.model_dir, trust_remote_code=True
             )
@@ -171,8 +174,12 @@ class Backend:
                 )
                 self.torch_vlm_model.set_compile_mode(False)
                 self.torch_vlm_model.set_model_device(self.device, torch.float32)
+            elif self.args.model_name in GEMMA4_MODELS:
+                self.torch_vlm_model = Gemma4Vision.load_model(self.args.model_dir)
+                self.torch_vlm_model.set_compile_mode(False)
+                self.torch_vlm_model.set_model_device(self.device, torch.float32)
 
-            if self.args.model_name not in SIGLIP_MODELS:
+            if self.args.model_name not in VISION_ONLY_MODELS:
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     self.args.model_dir, trust_remote_code=True
                 )
@@ -593,11 +600,15 @@ class Backend:
         """Prepare image inputs for BC VLM model."""
         if not self.bc_vlm_model:
             raise ValueError("BC VLM model is not loaded")
+        dtype = self.bc_vlm_model.functions[0].inputs[0].type.np_dtype
+        if self.args.model_name in GEMMA4_MODELS:
+            return {
+                "_input_0": image_input.squeeze(0).detach().cpu().numpy().astype(dtype)
+            }
         if image_input.dim() != 4:
             raise ValueError(
                 f"Expected 4D image input (N,C,H,W), got {image_input.dim()}D"
             )
-        dtype = self.bc_vlm_model.functions[0].inputs[0].type.np_dtype
         return {"_input_0": image_input.detach().cpu().numpy().astype(dtype)}
 
     def run_llm_hbm(self, text: str) -> tuple[TensorDict, None]:
@@ -678,7 +689,12 @@ class Backend:
         if self._hbm_vlm_module is None:
             raise RuntimeError("HBM VLM module not loaded. Check configuration.")
 
-        model_inputs = {"_input_0": image_input.cpu().type(torch.float16).numpy()}
+        if self.args.model_name in GEMMA4_MODELS:
+            model_inputs = {
+                "_input_0": image_input.squeeze(0).cpu().type(torch.float16).numpy()
+            }
+        else:
+            model_inputs = {"_input_0": image_input.cpu().type(torch.float16).numpy()}
         res = self._get_hbm_infer_res(self._hbm_vlm_module, model_inputs)
         return OrderedDict([(k, TensorInfo(v, name=k)) for k, v in res.items()])
 

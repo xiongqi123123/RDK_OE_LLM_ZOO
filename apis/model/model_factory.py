@@ -239,6 +239,20 @@ def _build_siglip_so400m(args):
     )
 
 
+@register_model("gemma4-e2b-vision", ["nash-e", "nash-m", "nash-p"])
+def _build_gemma4_e2b_vision(args):
+    from leap_llm.apis.model.gemma4 import Gemma4VisionApi
+
+    return Gemma4VisionApi(
+        input_model_path=args.input_model_path,
+        output_model_path=args.output_model_path,
+        calib_image_path=args.calib_image_path,
+        device=args.device,
+        model_type="gemma4-e2b",
+        core_num=args.vit_core_num,
+    )
+
+
 @register_model("qwen2_5-omni-3b", ["nash-e", "nash-m"])
 def _build_qwen2_5_omni_3b(args):
     from leap_llm.apis.model.qwen2_5_omni import Qwen2_5OmniApi

@@ -5,9 +5,11 @@ from typing import Dict, List
 from tqdm import tqdm
 
 from leap_llm.apis.calibration.data_loader import load_image_data, load_text_data
+from leap_llm.apis.model.gemma4 import _load_gemma4_image_data
 from leap_llm.apis.model.siglip import _load_siglip_image_data
 from leap_llm.apis.verifier.backends import (
     Backend,
+    GEMMA4_MODELS,
     SIGLIP_MODELS,
     TensorDict,
 )
@@ -24,6 +26,7 @@ SUPPORTED_MODELS = [
     "internvl2-1b",
     "internvl2_5-1b",
     "siglip-so400m",
+    "gemma4-e2b-vision",
 ]
 
 
@@ -154,7 +157,9 @@ def verify_model(verifier_args: VerifierArgs):
                 f"but VLM comparison was requested via {path_kind}"
             )
 
-        if verifier_args.model_name in SIGLIP_MODELS:
+        if verifier_args.model_name in GEMMA4_MODELS:
+            image_loader = _load_gemma4_image_data(verifier_args.input_image_path)
+        elif verifier_args.model_name in SIGLIP_MODELS:
             image_loader = _load_siglip_image_data(verifier_args.input_image_path)
         else:
             image_loader = load_image_data(verifier_args.input_image_path, max_num=1)
