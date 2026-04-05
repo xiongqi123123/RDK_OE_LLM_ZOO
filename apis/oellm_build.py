@@ -265,7 +265,7 @@ def main():
         paths = model.get_hbm_path()
         if len(paths) == 1:
             # Vision-only models (e.g., SigLIP) have a single VLM path
-            if "siglip" in args.model_name or "gemma4" in args.model_name:
+            if args.model_name in {"siglip-so400m", "gemma4-e2b-vision"}:
                 hbm_vlm_model_path = paths[0]
             else:
                 hbm_llm_model_path = paths[0]

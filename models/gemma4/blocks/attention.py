@@ -1,5 +1,3 @@
-import math
-
 import torch
 from hbdk4.compiler import leap
 
@@ -284,3 +282,238 @@ class Gemma4VisionAttention(Module):
         attn_output = attn_output.reshape(batch_size, num_patches, self.hidden_size)
 
         return self.o_proj(attn_output)
+
+
+class Gemma4TextRotaryPosEmb(Module):
+    def __init__(self):
+        super().__init__()
+        self.rotate_half = RotateHalf()
+        self.mul_x = FakeQuantMul(quantized=False)
+        self.mul_rot = FakeQuantMul(quantized=False)
+        self.add = FakeQuantAdd(quantized=False)
+        self.x_fq = ConstFakeQuant(16)
+
+    def build(self, x, cos, sin):
+        x = self.x_fq(x)
+        out = self.mul_x(x, cos)
+        rot = self.mul_rot(self.rotate_half(x), sin)
+        return self.add(out, rot)
+
+    def forward(self, x, cos, sin):
+        x = self.x_fq(x)
+        out = self.mul_x(x, cos)
+        rot = self.mul_rot(self.rotate_half(x), sin)
+        return self.add(out, rot)
+
+
+class Gemma4TextAttention(Module):
+    def __init__(
+        self,
+        hidden_size,
+        num_attention_heads,
+        num_key_value_heads,
+        head_dim,
+        rms_norm_eps,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+
+        self.q_proj = FakeQuantLinear(
+            hidden_size, num_attention_heads * head_dim, bias=False
+        )
+        self.k_proj = FakeQuantLinear(
+            hidden_size, num_key_value_heads * head_dim, bias=False
+        )
+        self.v_proj = FakeQuantLinear(
+            hidden_size,
+            num_key_value_heads * head_dim,
+            bias=False,
+            quant_bits=8,
+        )
+        self.o_proj = FakeQuantLinear(
+            num_attention_heads * head_dim, hidden_size, bias=False
+        )
+
+        self.q_norm = FakeQuantRMSNorm(head_dim, eps=rms_norm_eps)
+        self.k_norm = FakeQuantRMSNorm(head_dim, eps=rms_norm_eps)
+        self.v_norm = FakeQuantRMSNorm(head_dim, eps=rms_norm_eps, fuse_norm=True)
+
+        self.rotary = Gemma4TextRotaryPosEmb()
+        self.qk = FakeQuantMatmul(8, 8)
+        self.sv = FakeQuantMatmul(None, 8)
+        self.add_mask = FakeQuantAdd(quantized=True, quant_bits=16)
+        self.softmax = FakeQuantSoftmax(quant_bits=16, quantized=True)
+        self.key_out_fq = ConstFakeQuant(8)
+
+    def _build_states(self, hidden_states, cos, sin):
+        seq_len = hidden_states.type.shape[0]
+
+        query_states = self.q_proj(hidden_states)
+        query_states = leap.reshape(
+            query_states, [seq_len, self.num_heads, self.head_dim]
+        )
+        query_states = leap.transpose(query_states, [1, 0, 2])
+        query_states = self.q_norm(query_states)
+        query_states = self.rotary(query_states, cos, sin)
+
+        key_states = self.k_proj(hidden_states)
+        key_states = leap.reshape(
+            key_states, [seq_len, self.num_key_value_heads, self.head_dim]
+        )
+        key_states = leap.transpose(key_states, [1, 0, 2])
+        key_states = self.k_norm(key_states)
+        key_states = self.rotary(key_states, cos, sin)
+        key_states = self.key_out_fq(key_states)
+
+        value_states = self.v_proj(hidden_states)
+        value_states = leap.reshape(
+            value_states, [seq_len, self.num_key_value_heads, self.head_dim]
+        )
+        value_states = leap.transpose(value_states, [1, 0, 2])
+        value_states = self.v_norm(value_states)
+        return query_states, key_states, value_states
+
+    def _forward_states(self, hidden_states, cos, sin):
+        seq_len = hidden_states.shape[0]
+
+        query_states = self.q_proj(hidden_states)
+        query_states = query_states.reshape(
+            seq_len, self.num_heads, self.head_dim
+        ).transpose(1, 0)
+        query_states = self.q_norm(query_states)
+        query_states = self.rotary(query_states, cos, sin)
+
+        key_states = self.k_proj(hidden_states)
+        key_states = key_states.reshape(
+            seq_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 0)
+        key_states = self.k_norm(key_states)
+        key_states = self.rotary(key_states, cos, sin)
+        key_states = self.key_out_fq(key_states)
+
+        value_states = self.v_proj(hidden_states)
+        value_states = value_states.reshape(
+            seq_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 0)
+        value_states = self.v_norm(value_states)
+        return query_states, key_states, value_states
+
+    def _build_attention(self, query_states, cache_k, cache_v, mask):
+        _, cache_len, _ = cache_k.type.shape
+        heads, seq_len, _ = query_states.type.shape
+
+        query_states = leap.cast_type(query_states, output_type=leap.float32)
+        key_states_t = leap.transpose(cache_k, [0, 2, 1])
+        query_states = leap.reshape(
+            query_states,
+            [self.num_key_value_heads, self.num_key_value_groups * seq_len, self.head_dim],
+        )
+        attn_weights = self.qk(query_states, key_states_t)
+        attn_weights = leap.reshape(attn_weights, [heads, seq_len, cache_len])
+        # Gemma4 uses scaling=1.0 (QKV norms replace traditional 1/sqrt(d) scaling)
+        attn_weights = self.add_mask(attn_weights, mask)
+        attn_weights = self.softmax(attn_weights)
+        attn_weights = leap.reshape(
+            attn_weights,
+            [self.num_key_value_heads, self.num_key_value_groups * seq_len, cache_len],
+        )
+
+        attn_output = self.sv(attn_weights, cache_v)
+        attn_output = leap.reshape(attn_output, [heads, seq_len, self.head_dim])
+        attn_output = leap.transpose(attn_output, [1, 0, 2])
+        attn_output = leap.reshape(
+            attn_output, [seq_len, self.num_heads * self.head_dim]
+        )
+        return self.o_proj(attn_output)
+
+    def _forward_attention(self, query_states, cache_k, cache_v, mask):
+        _, cache_len, _ = cache_k.shape
+        heads, seq_len, _ = query_states.shape
+
+        query_states = query_states.to(cache_k.dtype)
+        key_states_t = cache_k.transpose(2, 1)
+        query_states = query_states.reshape(
+            self.num_key_value_heads,
+            self.num_key_value_groups * seq_len,
+            self.head_dim,
+        )
+        attn_weights = self.qk(query_states, key_states_t)
+        attn_weights = attn_weights.reshape(heads, seq_len, cache_len)
+        # Gemma4 uses scaling=1.0 (QKV norms replace traditional 1/sqrt(d) scaling)
+        attn_weights = self.add_mask(attn_weights, mask)
+        attn_weights = self.softmax(attn_weights)
+        attn_weights = attn_weights.reshape(
+            self.num_key_value_heads,
+            self.num_key_value_groups * seq_len,
+            cache_len,
+        )
+
+        attn_output = self.sv(attn_weights, cache_v)
+        attn_output = attn_output.reshape(heads, seq_len, self.head_dim)
+        attn_output = attn_output.transpose(1, 0)
+        attn_output = attn_output.reshape(seq_len, self.num_heads * self.head_dim)
+        return self.o_proj(attn_output)
+
+    def build(self, hidden_states, cos, sin, cache_k, cache_v, mask):
+        seq_len = hidden_states.type.shape[0]
+        query_states, key_states, value_states = self._build_states(
+            hidden_states, cos, sin
+        )
+
+        key_states = leap.cast_type(key_states, output_type=leap.float32)
+        value_states = leap.cast_type(value_states, output_type=leap.float32)
+
+        _, cache_len, _ = cache_k.type.shape
+        cache_k_full = leap.slice(
+            cache_k,
+            [0, seq_len, 0],
+            [self.num_key_value_heads, cache_len, self.head_dim],
+            [1, 1, 1],
+        )
+        cache_k_full = leap.concat([cache_k_full, key_states], 1)
+        cache_v_full = leap.slice(
+            cache_v,
+            [0, seq_len, 0],
+            [self.num_key_value_heads, cache_len, self.head_dim],
+            [1, 1, 1],
+        )
+        cache_v_full = leap.concat([cache_v_full, value_states], 1)
+
+        attn_output = self._build_attention(
+            query_states, cache_k_full, cache_v_full, mask
+        )
+        return attn_output, key_states, value_states, cache_k_full, cache_v_full
+
+    def build_shared(self, hidden_states, cos, sin, shared_cache_k, shared_cache_v, mask):
+        query_states, _, _ = self._build_states(hidden_states, cos, sin)
+        return self._build_attention(
+            query_states, shared_cache_k, shared_cache_v, mask
+        )
+
+    def forward(self, hidden_states, cos, sin, cache_k, cache_v, mask):
+        seq_len = hidden_states.shape[0]
+        query_states, key_states, value_states = self._forward_states(
+            hidden_states, cos, sin
+        )
+
+        key_states = key_states.to(torch.float32)
+        value_states = value_states.to(torch.float32)
+
+        cache_k_full = torch.cat([cache_k[:, seq_len:, :], key_states], dim=1)
+        cache_v_full = torch.cat([cache_v[:, seq_len:, :], value_states], dim=1)
+        attn_output = self._forward_attention(
+            query_states, cache_k_full, cache_v_full, mask
+        )
+        return attn_output, key_states, value_states, cache_k_full, cache_v_full
+
+    def forward_shared(
+        self, hidden_states, cos, sin, shared_cache_k, shared_cache_v, mask
+    ):
+        query_states, _, _ = self._forward_states(hidden_states, cos, sin)
+        return self._forward_attention(
+            query_states, shared_cache_k, shared_cache_v, mask
+        )
