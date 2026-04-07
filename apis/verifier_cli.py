@@ -27,6 +27,7 @@ SUPPORTED_MODELS = [
     "internvl2_5-1b",
     "siglip-so400m",
     "gemma4-e2b-vision",
+    "gemma4-e2b-text",
 ]
 
 

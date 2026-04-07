@@ -154,7 +154,13 @@ class Gemma4TextCalibrationDataPreparer:
         if self.pad_token_id is None:
             self.pad_token_id = self.tokenizer.eos_token_id
 
-    def _build_mask(self, total_seen: int, chunk_start: int, window: int | None):
+    def _build_mask(
+        self,
+        total_seen: int,
+        chunk_start: int,
+        chunk_valid: int,
+        window: int | None,
+    ):
         mask = torch.full(
             (self.chunk_size, self.cache_len),
             self.mask_value,
@@ -166,7 +172,8 @@ class Gemma4TextCalibrationDataPreparer:
 
         valid_total = min(total_seen, self.cache_len)
         cache_start_abs = total_seen - valid_total
-        cache_col_start = self.cache_len - valid_total
+        current_pad = self.chunk_size - chunk_valid
+        cache_col_start = self.cache_len - current_pad - valid_total
 
         for row in range(self.chunk_size):
             query_abs = chunk_start + row
@@ -222,8 +229,18 @@ class Gemma4TextCalibrationDataPreparer:
         for chunk_idx in range(len(input_chunks)):
             total_seen = min((chunk_idx + 1) * self.chunk_size, valid_len)
             chunk_start = chunk_idx * self.chunk_size
-            full_masks.append(self._build_mask(total_seen, chunk_start, None))
-            sliding_masks.append(self._build_mask(total_seen, chunk_start, self.sliding_window))
+            chunk_valid = min(valid_len - chunk_start, self.chunk_size)
+            full_masks.append(
+                self._build_mask(total_seen, chunk_start, chunk_valid, None)
+            )
+            sliding_masks.append(
+                self._build_mask(
+                    total_seen,
+                    chunk_start,
+                    chunk_valid,
+                    self.sliding_window,
+                )
+            )
 
         return input_chunks, position_chunks, full_masks, sliding_masks
 

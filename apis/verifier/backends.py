@@ -12,10 +12,11 @@ from hbdk4.compiler.overlay import Module, Value
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from leap_llm.apis.calibration import CalibrationDataPreparer
+from leap_llm.apis.model.gemma4 import Gemma4TextCalibrationDataPreparer
 from leap_llm.apis.verifier.types import TensorDict, TensorInfo, VerifierArgs
 from leap_llm.apis.verifier.utils import cast_to_tensor_info, time_block
 from leap_llm.models.deepseek.model import DeepSeek
-from leap_llm.models.gemma4.model import Gemma4Vision
+from leap_llm.models.gemma4.model import Gemma4Text, Gemma4Vision
 from leap_llm.models.internvl_1b.model import Internlm1b, Internvl1bVision
 from leap_llm.models.internvl_2b.model import Internlm2b, Internvl2bVision
 from leap_llm.models.siglip.model import SiglipVision
@@ -23,8 +24,10 @@ from leap_llm.models.siglip.model import SiglipVision
 DEEPSEEK_MODELS = ["deepseek-qwen-1_5b", "deepseek-qwen-7b"]
 INTERNVL_MODELS = ["internvl2-1b", "internvl2-2b", "internvl2_5-1b", "internvl2_5-2b"]
 SIGLIP_MODELS = ["siglip-so400m"]
-GEMMA4_MODELS = ["gemma4-e2b-vision"]
-VISION_ONLY_MODELS = SIGLIP_MODELS + GEMMA4_MODELS
+GEMMA4_VISION_MODELS = ["gemma4-e2b-vision"]
+GEMMA4_TEXT_MODELS = ["gemma4-e2b-text"]
+GEMMA4_MODELS = GEMMA4_VISION_MODELS + GEMMA4_TEXT_MODELS
+VISION_ONLY_MODELS = SIGLIP_MODELS + GEMMA4_VISION_MODELS
 padding_side_dict = {
     "internvl2-1b": "right",
     "internvl2-2b": "right",
@@ -32,6 +35,7 @@ padding_side_dict = {
     "internvl2_5-2b": "right",
     "deepseek-qwen-1_5b": "left",
     "deepseek-qwen-7b": "left",
+    "gemma4-e2b-text": "right",
 }
 
 mask_value_dict = {
@@ -41,6 +45,7 @@ mask_value_dict = {
     "internvl2_5-2b": -8192,
     "deepseek-qwen-1_5b": -512,
     "deepseek-qwen-7b": -512,
+    "gemma4-e2b-text": -32768,
 }
 
 
@@ -97,7 +102,16 @@ class Backend:
         self._hbm_vlm_module = self._load_hbm_module(self.args.hbm_vlm_model_path)
 
         # Registered visual subgraphs do not need text-side calibration preparation.
-        if self.args.model_name not in VISION_ONLY_MODELS:
+        if self.args.model_name in GEMMA4_TEXT_MODELS:
+            self.calib_data_preparer = Gemma4TextCalibrationDataPreparer(
+                self.args.model_dir,
+                chunk_size=self.args.chunk_size,
+                cache_len=self.args.cache_len,
+                sliding_window=self.torch_llm_model.config.sliding_window,
+                device=self.device,
+                mask_value=mask_value_dict[self.args.model_name],
+            )
+        elif self.args.model_name not in VISION_ONLY_MODELS:
             self.calib_data_preparer = CalibrationDataPreparer(
                 self.args.model_dir,
                 seq_len=self.args.chunk_size,
@@ -120,8 +134,12 @@ class Backend:
 
         ckpt_path = os.path.join(self.args.model_dir, "model_checkpoint.pth")
 
-        # Registered visual subgraphs (SigLip / Gemma4 vision) do not use AutoModelForCausalLM.
-        if self.args.model_name not in VISION_ONLY_MODELS:
+        # Registered visual subgraphs (SigLip / Gemma4 vision) and Gemma4 text
+        # use their own local wrappers instead of AutoModelForCausalLM.
+        if (
+            self.args.model_name not in VISION_ONLY_MODELS
+            and self.args.model_name not in GEMMA4_TEXT_MODELS
+        ):
             model = AutoModelForCausalLM.from_pretrained(
                 self.args.model_dir, trust_remote_code=True
             )
@@ -174,10 +192,18 @@ class Backend:
                 )
                 self.torch_vlm_model.set_compile_mode(False)
                 self.torch_vlm_model.set_model_device(self.device, torch.float32)
-            elif self.args.model_name in GEMMA4_MODELS:
+            elif self.args.model_name in GEMMA4_VISION_MODELS:
                 self.torch_vlm_model = Gemma4Vision.load_model(self.args.model_dir)
                 self.torch_vlm_model.set_compile_mode(False)
                 self.torch_vlm_model.set_model_device(self.device, torch.float32)
+            elif self.args.model_name in GEMMA4_TEXT_MODELS:
+                self.torch_llm_model = Gemma4Text.load_model(
+                    self.args.model_dir,
+                    chunk_size=self.args.chunk_size,
+                    cache_len=self.args.cache_len,
+                )
+                self.torch_llm_model.set_compile_mode(False)
+                self.torch_llm_model.set_model_device(self.device, torch.float32)
 
             if self.args.model_name not in VISION_ONLY_MODELS:
                 self.tokenizer = AutoTokenizer.from_pretrained(
@@ -230,6 +256,20 @@ class Backend:
         chunk_size = self.args.chunk_size
         if padding_side == "left":
             return chunk_size - 1
+
+        if self.args.model_name in GEMMA4_TEXT_MODELS:
+            input_chunks, position_chunks, _full_masks, _sliding_masks = (
+                self.get_prepared_inputs(text_input)
+            )
+            if not input_chunks or not position_chunks:
+                return None
+
+            pos_last = position_chunks[-1]
+            pos_arr = pos_last.detach().cpu().view(-1).tolist()
+            i = len(pos_arr) - 1
+            while i > 0 and pos_arr[i] == pos_arr[i - 1]:
+                i -= 1
+            return i
 
         (
             input_chunks,
@@ -366,6 +406,12 @@ class Backend:
 
         input_dict = {}
 
+        if model_name in GEMMA4_TEXT_MODELS:
+            raise ValueError(
+                "Gemma4 text uses custom chunk input preparation and should not "
+                "call prepare_llm_chunk_inputs"
+            )
+
         if model_name in INTERNVL_MODELS:
             embedding_layer = getattr(
                 torch_llm_model.model, "embed_tokens", None
@@ -447,6 +493,51 @@ class Backend:
     def _run_torch_llm_inference(self, text_input: str) -> TensorDict:
         if self.calib_data_preparer is None:
             raise ValueError("CalibrationDataPreparer is not initialized.")
+
+        if self.args.model_name in GEMMA4_TEXT_MODELS:
+            (
+                input_chunks,
+                position_chunks,
+                full_masks,
+                sliding_masks,
+            ) = self.get_prepared_inputs(text_input)
+
+            if not input_chunks:
+                raise ValueError("No input chunks prepared")
+
+            caches = self.torch_llm_model.build_empty_caches(
+                device=self.device, transpose_cache=True
+            )
+            outputs = None
+            for idx, (input_ids, position_ids, full_mask, sliding_mask) in enumerate(
+                zip(input_chunks, position_chunks, full_masks, sliding_masks)
+            ):
+                input_ids = input_ids.to(self.device)
+                position_ids = position_ids.to(self.device)
+                full_mask = full_mask.to(self.device)
+                sliding_mask = sliding_mask.to(self.device)
+                inputs_embeds = self.torch_llm_model.get_input_embeddings(input_ids)
+
+                with time_block(f"Torch LLM chunk_{idx}"):
+                    outputs = self.torch_llm_model.forward(
+                        inputs_embeds,
+                        input_ids,
+                        position_ids,
+                        full_mask,
+                        sliding_mask,
+                        caches,
+                    )
+
+                caches = self.torch_llm_model.update_caches(
+                    caches,
+                    list(outputs[1:]),
+                    input_ids.shape[-1],
+                )
+
+            if outputs is None:
+                raise ValueError("Inference did not produce any output.")
+
+            return cast_to_tensor_info(outputs)
 
         (
             input_chunks,
@@ -541,6 +632,47 @@ class Backend:
         return True
 
     def _run_bc_llm_inference(self, text_input: str):
+        if self.args.model_name in GEMMA4_TEXT_MODELS:
+            (
+                input_chunks,
+                position_chunks,
+                full_masks,
+                sliding_masks,
+            ) = self.get_prepared_inputs(text_input)
+
+            if not input_chunks:
+                raise ValueError("No input chunks prepared")
+
+            caches = self.torch_llm_model.build_empty_caches(
+                device="cpu", transpose_cache=True
+            )
+            outputs = None
+            for idx, (input_ids, position_ids, full_mask, sliding_mask) in enumerate(
+                zip(input_chunks, position_chunks, full_masks, sliding_masks)
+            ):
+                feed_dict = self._prepare_gemma4_text_chunk_inputs(
+                    input_ids,
+                    position_ids,
+                    full_mask,
+                    sliding_mask,
+                    caches,
+                    [
+                        (inp.name, inp.type.shape, inp.type.np_dtype)
+                        for inp in self.bc_model.functions[0].inputs
+                    ],
+                )
+
+                with time_block(f"BC LLM chunk_{idx}"):
+                    outputs = self.bc_model.functions[0].feed(inputs=feed_dict)
+
+                caches = self.torch_llm_model.update_caches(
+                    caches,
+                    self._extract_gemma4_text_new_caches(outputs),
+                    input_ids.shape[-1],
+                )
+
+            return outputs
+
         (
             input_chunks,
             causal_mask_chunks,
@@ -601,7 +733,7 @@ class Backend:
         if not self.bc_vlm_model:
             raise ValueError("BC VLM model is not loaded")
         dtype = self.bc_vlm_model.functions[0].inputs[0].type.np_dtype
-        if self.args.model_name in GEMMA4_MODELS:
+        if self.args.model_name in GEMMA4_VISION_MODELS:
             return {
                 "_input_0": image_input.squeeze(0).detach().cpu().numpy().astype(dtype)
             }
@@ -633,6 +765,52 @@ class Backend:
 
         if self.torch_llm_model is None:
             raise ValueError("Torch LLM model not loaded")
+
+        if self.args.model_name in GEMMA4_TEXT_MODELS:
+            (
+                input_chunks,
+                position_chunks,
+                full_masks,
+                sliding_masks,
+            ) = self.get_prepared_inputs(text_input)
+
+            if not input_chunks:
+                raise ValueError("No input chunks prepared")
+
+            if self._hbm_llm_module is None:
+                raise ValueError("HBM LLM module not loaded")
+
+            hbm_inputs_meta = [
+                (inp.name, inp.type.shape, inp.type.np_dtype)
+                for inp in self._hbm_llm_module.inputs
+            ]
+
+            caches = self.torch_llm_model.build_empty_caches(
+                device="cpu", transpose_cache=True
+            )
+            outputs = None
+            for input_ids, position_ids, full_mask, sliding_mask in zip(
+                input_chunks, position_chunks, full_masks, sliding_masks
+            ):
+                model_inputs = self._prepare_gemma4_text_chunk_inputs(
+                    input_ids,
+                    position_ids,
+                    full_mask,
+                    sliding_mask,
+                    caches,
+                    hbm_inputs_meta,
+                )
+                outputs = self._get_hbm_infer_res(self._hbm_llm_module, model_inputs)
+                caches = self.torch_llm_model.update_caches(
+                    caches,
+                    self._extract_gemma4_text_new_caches(outputs),
+                    input_ids.shape[-1],
+                )
+
+            if outputs is None:
+                raise ValueError("HBM inference did not produce any output.")
+
+            return OrderedDict({k: TensorInfo(v, name=k) for k, v in outputs.items()})
 
         (
             input_chunks,
@@ -689,7 +867,7 @@ class Backend:
         if self._hbm_vlm_module is None:
             raise RuntimeError("HBM VLM module not loaded. Check configuration.")
 
-        if self.args.model_name in GEMMA4_MODELS:
+        if self.args.model_name in GEMMA4_VISION_MODELS:
             model_inputs = {
                 "_input_0": image_input.squeeze(0).cpu().type(torch.float16).numpy()
             }
@@ -726,3 +904,47 @@ class Backend:
                 f"{self.args.remote_ip}: {exc}"
             )
             raise ConnectionError(msg)
+
+    def _prepare_gemma4_text_chunk_inputs(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        full_mask: torch.Tensor,
+        sliding_mask: torch.Tensor,
+        caches: List[torch.Tensor],
+        model_meta: list,
+    ) -> dict:
+        if self.torch_llm_model is None:
+            raise ValueError("Torch LLM model not loaded")
+
+        inputs_embeds = self.torch_llm_model.get_input_embeddings(input_ids)
+        primary_inputs = [
+            inputs_embeds.squeeze(0),
+            input_ids,
+            position_ids,
+            full_mask,
+            sliding_mask,
+        ]
+
+        input_dict = {}
+        for i, input_data in enumerate(primary_inputs):
+            name, _shape, dtype = model_meta[i]
+            input_dict[name] = input_data.detach().cpu().numpy().astype(dtype)
+
+        for idx in range(5, len(model_meta)):
+            name, _shape, dtype = model_meta[idx]
+            input_dict[name] = caches[idx - 5].detach().cpu().numpy().astype(dtype)
+
+        return input_dict
+
+    @staticmethod
+    def _extract_gemma4_text_new_caches(outputs: dict) -> List[torch.Tensor]:
+        cache_keys = [
+            key
+            for key in sorted(
+                outputs.keys(),
+                key=lambda name: int(name.split("_")[-1]),
+            )
+            if key.startswith("_output_") and key != "_output_0"
+        ]
+        return [torch.from_numpy(outputs[key]) for key in cache_keys]

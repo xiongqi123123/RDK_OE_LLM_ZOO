@@ -92,6 +92,7 @@ class Gemma4TextDecoderLayer(Module):
         self.store_full_length_kv = store_full_length_kv
         self.hidden_size = config.hidden_size
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
+        chunked_sv_layers = set(range(24, 35))
 
         self.self_attn = Gemma4TextAttention(
             hidden_size=config.hidden_size,
@@ -99,6 +100,8 @@ class Gemma4TextDecoderLayer(Module):
             num_key_value_heads=config.num_key_value_heads,
             head_dim=head_dim,
             rms_norm_eps=config.rms_norm_eps,
+            use_chunked_sv=layer_idx in chunked_sv_layers,
+            sv_chunk_size=1024,
         )
         self.mlp = Gemma4TextMLP(
             hidden_size=config.hidden_size,

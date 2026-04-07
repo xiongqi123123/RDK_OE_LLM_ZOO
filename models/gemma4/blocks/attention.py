@@ -314,6 +314,8 @@ class Gemma4TextAttention(Module):
         num_key_value_heads,
         head_dim,
         rms_norm_eps,
+        use_chunked_sv=False,
+        sv_chunk_size=1024,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -321,6 +323,8 @@ class Gemma4TextAttention(Module):
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.use_chunked_sv = use_chunked_sv
+        self.sv_chunk_size = sv_chunk_size
 
         self.q_proj = FakeQuantLinear(
             hidden_size, num_attention_heads * head_dim, bias=False
@@ -344,10 +348,15 @@ class Gemma4TextAttention(Module):
 
         self.rotary = Gemma4TextRotaryPosEmb()
         self.qk = FakeQuantMatmul(8, 8)
-        self.sv = FakeQuantMatmul(None, 8)
+        self.sv = FakeQuantMatmul(16, 8, 16)
         self.add_mask = FakeQuantAdd(quantized=True, quant_bits=16)
         self.softmax = FakeQuantSoftmax(quant_bits=16, quantized=True)
         self.key_out_fq = ConstFakeQuant(8)
+        self.value_out_fq = ConstFakeQuant(8)
+        self.cache_k_fq = ConstFakeQuant(8)
+        self.cache_v_fq = ConstFakeQuant(8)
+        self.sv_input_fq = ConstFakeQuant(16)
+        self.add_sv = FakeQuantAdd(quantized=False)
 
     def _build_states(self, hidden_states, cos, sin):
         seq_len = hidden_states.type.shape[0]
@@ -375,6 +384,7 @@ class Gemma4TextAttention(Module):
         )
         value_states = leap.transpose(value_states, [1, 0, 2])
         value_states = self.v_norm(value_states)
+        value_states = self.value_out_fq(value_states)
         return query_states, key_states, value_states
 
     def _forward_states(self, hidden_states, cos, sin):
@@ -400,9 +410,12 @@ class Gemma4TextAttention(Module):
             seq_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 0)
         value_states = self.v_norm(value_states)
+        value_states = self.value_out_fq(value_states)
         return query_states, key_states, value_states
 
     def _build_attention(self, query_states, cache_k, cache_v, mask):
+        cache_k = self.cache_k_fq(cache_k)
+        cache_v = self.cache_v_fq(cache_v)
         _, cache_len, _ = cache_k.type.shape
         heads, seq_len, _ = query_states.type.shape
 
@@ -421,8 +434,9 @@ class Gemma4TextAttention(Module):
             attn_weights,
             [self.num_key_value_heads, self.num_key_value_groups * seq_len, cache_len],
         )
+        attn_weights = self.sv_input_fq(attn_weights)
 
-        attn_output = self.sv(attn_weights, cache_v)
+        attn_output = self._build_sv(attn_weights, cache_v)
         attn_output = leap.reshape(attn_output, [heads, seq_len, self.head_dim])
         attn_output = leap.transpose(attn_output, [1, 0, 2])
         attn_output = leap.reshape(
@@ -431,6 +445,8 @@ class Gemma4TextAttention(Module):
         return self.o_proj(attn_output)
 
     def _forward_attention(self, query_states, cache_k, cache_v, mask):
+        cache_k = self.cache_k_fq(cache_k)
+        cache_v = self.cache_v_fq(cache_v)
         _, cache_len, _ = cache_k.shape
         heads, seq_len, _ = query_states.shape
 
@@ -451,12 +467,65 @@ class Gemma4TextAttention(Module):
             self.num_key_value_groups * seq_len,
             cache_len,
         )
+        attn_weights = self.sv_input_fq(attn_weights)
 
-        attn_output = self.sv(attn_weights, cache_v)
+        attn_output = self._forward_sv(attn_weights, cache_v)
         attn_output = attn_output.reshape(heads, seq_len, self.head_dim)
         attn_output = attn_output.transpose(1, 0)
         attn_output = attn_output.reshape(seq_len, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
+
+    def _build_sv(self, attn_weights, cache_v):
+        if not self.use_chunked_sv:
+            return self.sv(attn_weights, cache_v)
+
+        _, groups_seq_len, cache_len = attn_weights.type.shape
+        if cache_len <= self.sv_chunk_size:
+            return self.sv(attn_weights, cache_v)
+
+        attn_output = None
+        _, _, head_dim = cache_v.type.shape
+        for start in range(0, cache_len, self.sv_chunk_size):
+            end = min(start + self.sv_chunk_size, cache_len)
+            attn_chunk = leap.slice(
+                attn_weights,
+                [0, 0, start],
+                [self.num_key_value_heads, groups_seq_len, end],
+                [1, 1, 1],
+            )
+            cache_v_chunk = leap.slice(
+                cache_v,
+                [0, start, 0],
+                [self.num_key_value_heads, end, head_dim],
+                [1, 1, 1],
+            )
+            chunk_output = self.sv(attn_chunk, cache_v_chunk)
+            if attn_output is None:
+                attn_output = chunk_output
+            else:
+                attn_output = self.add_sv(attn_output, chunk_output)
+        return attn_output
+
+    def _forward_sv(self, attn_weights, cache_v):
+        if not self.use_chunked_sv:
+            return self.sv(attn_weights, cache_v)
+
+        _, _, cache_len = attn_weights.shape
+        if cache_len <= self.sv_chunk_size:
+            return self.sv(attn_weights, cache_v)
+
+        attn_output = None
+        for start in range(0, cache_len, self.sv_chunk_size):
+            end = min(start + self.sv_chunk_size, cache_len)
+            chunk_output = self.sv(
+                attn_weights[:, :, start:end],
+                cache_v[:, start:end, :],
+            )
+            if attn_output is None:
+                attn_output = chunk_output
+            else:
+                attn_output = self.add_sv(attn_output, chunk_output)
+        return attn_output
 
     def build(self, hidden_states, cos, sin, cache_k, cache_v, mask):
         seq_len = hidden_states.type.shape[0]
